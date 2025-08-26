@@ -14,11 +14,11 @@ import (
 	"runtime"
 	"strconv"
 
+	"github.com/fractal-networking/wireguard-go/conn"
+	"github.com/fractal-networking/wireguard-go/device"
+	"github.com/fractal-networking/wireguard-go/ipc"
+	"github.com/fractal-networking/wireguard-go/tun"
 	"golang.org/x/sys/unix"
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/ipc"
-	"golang.zx2c4.com/wireguard/tun"
 )
 
 const (
