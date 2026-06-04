@@ -212,7 +212,7 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		}
 
 		// update port and rebind
-		device.log.Verbosef("UAPI: Updating listen port")
+		device.log.Verbosef("UAPI: Updating listen port to %d", port)
 
 		device.net.Lock()
 		device.net.port = uint16(port)
@@ -264,6 +264,7 @@ func (peer *ipcSetPeer) handlePostConfig() {
 	}
 	if peer.device.isUp() {
 		peer.Start()
+		peer.SendHandshakeInitiation(false)
 		if peer.pkaOn {
 			peer.SendKeepalive()
 		}
@@ -338,8 +339,8 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		}
 
 	case "endpoint":
-		device.log.Verbosef("%v - UAPI: Updating endpoint", peer.Peer)
 		endpoint, err := device.net.bind.ParseEndpoint(value)
+		device.log.Verbosef("%v - UAPI: Updating endpoint to %v", peer.Peer, endpoint.DstToString())
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set endpoint %v: %w", value, err)
 		}
@@ -348,9 +349,8 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		peer.endpoint.val = endpoint
 
 	case "persistent_keepalive_interval":
-		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
-
 		secs, err := strconv.ParseUint(value, 10, 16)
+		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval to %d", peer.Peer, secs)
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set persistent keepalive interval: %w", err)
 		}
@@ -380,6 +380,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		}
 		device.log.Verbosef("%v - UAPI: %s allowedip", peer.Peer, verb)
 		prefix, err := netip.ParsePrefix(value)
+		device.log.Verbosef("%v - UAPI: Adding allowedip: %v", peer.Peer, prefix.String())
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set allowed ip: %w", err)
 		}
@@ -396,6 +397,52 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		if value != "1" {
 			return ipcErrorf(ipc.IpcErrorInvalid, "invalid protocol version: %v", value)
 		}
+
+	case "reserved":
+		if len(value) != 10 {
+			return ipcErrorf(ipc.IpcErrorInvalid, "invalid reserved value: %v", value)
+		}
+		var reserved [3]uint8
+		for i := 0; i < 3; i++ {
+			b, err := strconv.ParseUint(value[i*2:i*2+2], 16, 8)
+			if err != nil {
+				// handle error
+			}
+			reserved[i] = uint8(b)
+		}
+		device.log.Verbosef("%v - UAPI: Setting reserved: %v ", peer.Peer, reserved)
+		// then set this value somewhere in your config
+		peer.reserved = reserved
+
+	case "enable_warp_noise_gen":
+		isWarpNoiseGenEnabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed enabling warp unblocker: %w", err)
+		}
+		if isWarpNoiseGenEnabled {
+			device.log.Verbosef("%v - UAPI: Enabling WARP noise generator", peer.Peer)
+			peer.warp.noise.enableNoiseGen = isWarpNoiseGenEnabled
+		}
+
+	case "warp_noise_packet_count":
+		minPacket, maxPacket, err := parseIntRange(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set warp noise generator's packet count: %w", err)
+		}
+		device.log.Verbosef("%v - UAPI: Updating WARP noise generator's packet count range to %d-%d", peer.Peer, minPacket, maxPacket)
+
+		peer.warp.noise.packetCountMin = minPacket
+		peer.warp.noise.packetCountMax = maxPacket
+
+	case "warp_noise_packet_delay":
+		minDelay, maxDelay, err := parseIntRange(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set warp noise generator's packet delay: %w", err)
+		}
+		device.log.Verbosef("%v - UAPI: Updating WARP noise generator's packet delay range to %d-%d", peer.Peer, minDelay, maxDelay)
+
+		peer.warp.noise.packetDelayMin = minDelay
+		peer.warp.noise.packetDelayMax = maxDelay
 
 	default:
 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI peer key: %v", key)
@@ -465,4 +512,28 @@ func (device *Device) IpcHandle(socket net.Conn) {
 		}
 		buffered.Flush()
 	}
+}
+
+func parseIntRange(rangeStr string) (int, int, error) {
+	parts := strings.Split(rangeStr, "-")
+
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid range format: expected 'start-end', got '%s'", rangeStr)
+	}
+
+	start, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid start value '%s': %v", parts[0], err)
+	}
+
+	end, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid end value '%s': %v", parts[1], err)
+	}
+
+	if start > end {
+		return 0, 0, fmt.Errorf("invalid range: start (%d) cannot be greater than end (%d)", start, end)
+	}
+
+	return start, end, nil
 }

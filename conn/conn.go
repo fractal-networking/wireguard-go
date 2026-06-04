@@ -170,3 +170,12 @@ func (fn ReceiveFunc) PrettyName() string {
 	}
 	return name
 }
+
+func EndpointDstAddrPort(ep Endpoint) (netip.AddrPort, error) {
+	dstStr := ep.DstToString() // e.g., "192.0.2.1:12345"
+	ap, err := netip.ParseAddrPort(dstStr)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("failed to parse DstToString()=%q: %w", dstStr, err)
+	}
+	return ap, nil
+}

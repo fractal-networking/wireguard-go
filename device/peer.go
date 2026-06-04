@@ -78,9 +78,20 @@ type Peer struct {
 		inbound  *autodrainingInboundQueue            // sequential ordering of tun writing
 	}
 
+	warp struct {
+		noise struct {
+			enableNoiseGen bool
+			packetCountMin int
+			packetCountMax int
+			packetDelayMin int
+			packetDelayMax int
+		}
+	}
+
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
+	reserved                    [3]byte
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
@@ -483,4 +494,24 @@ func (peer *Peer) markEndpointSrcForClearing() {
 		return
 	}
 	peer.endpoint.clearSrcOnTx = true
+}
+
+func (peer *Peer) UpdateEndpoint(endpoint conn.Endpoint) {
+	peer.device.log.Verbosef("%v - Updating endpoint to : %v", peer, endpoint.DstToString())
+	// Clear all key material and handshake state
+	peer.ZeroAndFlushAll()
+
+	peer.endpoint.Lock()
+	defer peer.endpoint.Unlock()
+	if peer.endpoint.disableRoaming {
+		return
+	}
+	peer.endpoint.val.ClearSrc()
+	peer.endpoint.clearSrcOnTx = false
+	peer.endpoint.val = endpoint
+
+	// // Reset handshake attempts counter
+	peer.timers.handshakeAttempts.Store(0)
+	peer.timers.sentLastMinuteHandshake.Store(false)
+	peer.timers.needAnotherKeepalive.Store(false)
 }
