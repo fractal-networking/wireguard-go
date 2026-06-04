@@ -8,6 +8,8 @@ package device
 import (
 	"container/list"
 	"errors"
+	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,9 +27,24 @@ type Peer struct {
 	rxBytes           atomic.Uint64  // bytes received from peer
 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
 
+	sessionState struct {
+		sync.Mutex
+		current        PeerSessionState
+		sessionExpires time.Time
+	}
+
+	queuedOutboundPackets atomic.Int32 // packets in staged+outbound queues, for input backpressure
+
+	// deleteOnIdle indicates whether the peer should be deleted when idle
+	// because it was auto-created via a Device.PeerLookupFunc.
+	//
+	// This field should only be set once, before the peer is started.
+	deleteOnIdle bool
+
 	endpoint struct {
 		sync.Mutex
 		val            conn.Endpoint
+		candidates     []conn.Endpoint
 		clearSrcOnTx   bool // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
 	}
@@ -36,6 +53,7 @@ type Peer struct {
 		retransmitHandshake     *Timer
 		sendKeepalive           *Timer
 		newHandshake            *Timer
+		sessionExpired          *Timer
 		zeroKeyMaterial         *Timer
 		persistentKeepalive     *Timer
 		handshakeAttempts       atomic.Uint32
@@ -44,7 +62,14 @@ type Peer struct {
 	}
 
 	state struct {
-		sync.Mutex // protects against concurrent Start/Stop
+		sync.Mutex // protects against concurrent Start/Stop, and fields below
+
+		allowedIPs []netip.Prefix
+
+		// testAllowedIP, if non-nil, is used to test whether the peer is
+		// allowed to send a packet from the given IP address. It can be read
+		// without locking, but must be set with the state mutex locked.
+		testAllowedIP atomic.Pointer[func(netip.Addr) bool]
 	}
 
 	queue struct {
@@ -87,7 +112,7 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	// map public key
 	_, ok := device.peers.keyMap[pk]
 	if ok {
-		return nil, errors.New("adding existing peer")
+		return nil, errAddExistingPeer
 	}
 
 	// pre-compute DH
@@ -113,6 +138,30 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	return peer, nil
 }
 
+// SetAllowedIPs sets the allowed IP prefixes for this peer.
+//
+// If the allowedIPs are unchanged since the last call, this method is a no-op.
+// It's the caller's responsibility to ensure that no two peers have duplicate
+// allowed IPs. If so, the last writer wins.
+func (p *Peer) SetAllowedIPs(allowedIPs []netip.Prefix) {
+	p.state.Lock()
+	defer p.state.Unlock()
+
+	if slices.Equal(p.state.allowedIPs, allowedIPs) {
+		return
+	}
+	p.device.allowedips.setPeerPrefixes(p, allowedIPs)
+
+	allowedIPs = slices.Clone(allowedIPs) // avoid retaining caller's slice
+	p.state.allowedIPs = allowedIPs
+
+	f := mkIPInCIDRsTestFunc(allowedIPs)
+	p.state.testAllowedIP.Store(&f)
+}
+
+// SendBuffers sends buffers to peer. WireGuard packet data in each element of
+// buffers must be preceded by MessageEncapsulatingTransportSize number of
+// bytes.
 func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	peer.device.net.RLock()
 	defer peer.device.net.RUnlock()
@@ -133,13 +182,15 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	}
 	peer.endpoint.Unlock()
 
-	err := peer.device.net.bind.Send(buffers, endpoint)
+	err := peer.device.net.bind.Send(buffers, endpoint, MessageEncapsulatingTransportSize)
 	if err == nil {
 		var totalLen uint64
 		for _, b := range buffers {
 			totalLen += uint64(len(b))
 		}
 		peer.txBytes.Add(totalLen)
+	} else if errors.Is(err, conn.ErrRebindRequired) {
+		peer.device.scheduleBindUpdate()
 	}
 	return err
 }
@@ -190,6 +241,7 @@ func (peer *Peer) Start() {
 	// reset routine state
 	peer.stopping.Wait()
 	peer.stopping.Add(2)
+	peer.queuedOutboundPackets.Store(0)
 
 	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
@@ -199,8 +251,8 @@ func (peer *Peer) Start() {
 
 	peer.timersStart()
 
-	device.flushInboundQueue(peer.queue.inbound)
-	device.flushOutboundQueue(peer.queue.outbound)
+	device.flushInboundQueue(peer.queue.inbound.c)
+	device.flushOutboundQueue(peer.queue.outbound.c)
 
 	// Use the device batch size, not the bind batch size, as the device size is
 	// the size of the batch pools.
@@ -209,10 +261,21 @@ func (peer *Peer) Start() {
 	go peer.RoutineSequentialReceiver(batchSize)
 
 	peer.isRunning.Store(true)
+
+	// A lazily-created peer that never completes a handshake otherwise never
+	// arms its reaping timer. Arm it here, while running under state.Lock, so
+	// it's reclaimed after RejectAfterTime*3 of no session and is guaranteed to
+	// be torn down by a matching Stop. A completed handshake re-Mods it.
+	if peer.deleteOnIdle {
+		peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
+	}
 }
 
 func (peer *Peer) ZeroAndFlushAll() {
 	device := peer.device
+	if peer.timers.sessionExpired != nil {
+		peer.timers.sessionExpired.Del()
+	}
 
 	// clear key pairs
 
@@ -235,6 +298,11 @@ func (peer *Peer) ZeroAndFlushAll() {
 	handshake.mutex.Unlock()
 
 	peer.FlushStagedPackets()
+
+	peer.sessionState.Lock()
+	peer.sessionState.sessionExpires = time.Time{}
+	peer.noteSessionStateLocked(PeerSessionNone)
+	peer.sessionState.Unlock()
 }
 
 func (peer *Peer) ExpireCurrentKeypairs() {
@@ -254,6 +322,11 @@ func (peer *Peer) ExpireCurrentKeypairs() {
 		next.sendNonce.Store(RejectAfterMessages)
 	}
 	keypairs.Unlock()
+
+	peer.sessionState.Lock()
+	peer.sessionState.sessionExpires = time.Time{}
+	peer.noteSessionStateLocked(PeerSessionExpired)
+	peer.sessionState.Unlock()
 }
 
 func (peer *Peer) Stop() {
@@ -276,6 +349,51 @@ func (peer *Peer) Stop() {
 	peer.ZeroAndFlushAll()
 }
 
+func (peer *Peer) noteSessionState(state PeerSessionState) {
+	peer.sessionState.Lock()
+	defer peer.sessionState.Unlock()
+	peer.noteSessionStateLocked(state)
+}
+
+// noteSessionStateLocked records a session state transition and delivers the
+// callback. The caller must hold peer.sessionState.Mutex during the
+// state determination and transition.
+func (peer *Peer) noteSessionStateLocked(state PeerSessionState) {
+	if peer.sessionState.current == state {
+		return
+	}
+	peer.sessionState.current = state
+	if f := peer.device.peerStateFn.Load(); f != nil {
+		(*f)(peer.handshake.remoteStatic, state)
+	}
+}
+
+func (peer *Peer) noteSessionHandshakeStarted() {
+	peer.sessionState.Lock()
+	defer peer.sessionState.Unlock()
+	if peer.sessionState.current == PeerSessionEstablished {
+		return
+	}
+	peer.noteSessionStateLocked(PeerSessionHandshake)
+}
+
+func (peer *Peer) noteSessionHandshakeStopped() {
+	peer.sessionState.Lock()
+	defer peer.sessionState.Unlock()
+	state := PeerSessionNone
+	if peer.hasKeyMaterial() {
+		state = PeerSessionExpired
+	}
+	peer.noteSessionStateLocked(state)
+}
+
+func (peer *Peer) hasKeyMaterial() bool {
+	keypairs := &peer.keypairs
+	keypairs.RLock()
+	defer keypairs.RUnlock()
+	return keypairs.previous != nil || keypairs.current != nil || keypairs.next.Load() != nil
+}
+
 func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
@@ -284,6 +402,78 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	}
 	peer.endpoint.clearSrcOnTx = false
 	peer.endpoint.val = endpoint
+}
+
+func (peer *Peer) resolveEndpoints() []conn.Endpoint {
+	resolver := peer.device.endpointResolverFn.Load()
+	if resolver == nil {
+		return nil
+	}
+	resolved, err := (*resolver)(peer.handshake.remoteStatic)
+	peer.endpoint.Lock()
+	defer peer.endpoint.Unlock()
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to resolve endpoints: %v", peer, err)
+	} else if len(resolved) > 0 {
+		peer.endpoint.candidates = resolved
+	}
+	return peer.endpoint.candidates
+}
+
+// sendHandshakeBuffers sends buffers to the peer's current endpoint and every
+// candidate. It succeeds when at least one endpoint accepted the send.
+func (peer *Peer) sendHandshakeBuffers(buffers [][]byte, candidates []conn.Endpoint) error {
+	peer.device.net.RLock()
+	defer peer.device.net.RUnlock()
+
+	if peer.device.isClosed() {
+		return nil
+	}
+
+	peer.endpoint.Lock()
+	current := peer.endpoint.val
+	if current != nil && peer.endpoint.clearSrcOnTx {
+		current.ClearSrc()
+		peer.endpoint.clearSrcOnTx = false
+	}
+	peer.endpoint.Unlock()
+
+	endpoints := make([]conn.Endpoint, 0, len(candidates)+1)
+	if current != nil {
+		endpoints = append(endpoints, current)
+	}
+	for _, candidate := range candidates {
+		duplicate := slices.ContainsFunc(endpoints, func(endpoint conn.Endpoint) bool {
+			return endpoint.DstToString() == candidate.DstToString()
+		})
+		if !duplicate {
+			endpoints = append(endpoints, candidate)
+		}
+	}
+	if len(endpoints) == 0 {
+		return errors.New("no known endpoint for peer")
+	}
+
+	var totalLen uint64
+	for _, buffer := range buffers {
+		totalLen += uint64(len(buffer))
+	}
+
+	var firstErr error
+	sent := false
+	for _, endpoint := range endpoints {
+		err := peer.device.net.bind.Send(buffers, endpoint, MessageEncapsulatingTransportSize)
+		if err == nil {
+			sent = true
+			peer.txBytes.Add(totalLen)
+		} else if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if sent {
+		return nil
+	}
+	return firstErr
 }
 
 func (peer *Peer) markEndpointSrcForClearing() {

@@ -12,11 +12,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fractal-networking/wireguard-go/conn"
+	"github.com/fractal-networking/wireguard-go/tai64n"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
-
-	"github.com/fractal-networking/wireguard-go/tai64n"
 )
 
 type handshakeState int
@@ -61,13 +61,14 @@ const (
 )
 
 const (
-	MessageInitiationSize      = 148                                           // size of handshake initiation message
-	MessageResponseSize        = 92                                            // size of response message
-	MessageCookieReplySize     = 64                                            // size of cookie reply message
-	MessageTransportHeaderSize = 16                                            // size of data preceding content in transport message
-	MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
-	MessageKeepaliveSize       = MessageTransportSize                          // size of keepalive
-	MessageHandshakeSize       = MessageInitiationSize                         // size of largest handshake related message
+	MessageInitiationSize             = 148                                           // size of handshake initiation message
+	MessageResponseSize               = 92                                            // size of response message
+	MessageCookieReplySize            = 64                                            // size of cookie reply message
+	MessageTransportHeaderSize        = 16                                            // size of data preceding content in transport message
+	MessageEncapsulatingTransportSize = 8                                             // size of optional, free (for use by conn.Bind.Send()) space preceding the transport header
+	MessageTransportSize              = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
+	MessageKeepaliveSize              = MessageTransportSize                          // size of keepalive
+	MessageHandshakeSize              = MessageInitiationSize                         // size of largest handshake related message
 )
 
 const (
@@ -337,7 +338,7 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	return &msg, nil
 }
 
-func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation, endpoint conn.Endpoint) *Peer {
 	var (
 		hash     [blake2s.Size]byte
 		chainKey [blake2s.Size]byte
@@ -347,17 +348,22 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 		return nil
 	}
 
+	// Snapshot staticIdentity so we don't hold the RLock across LookupPeer,
+	// which may call NewPeer (reentrant RLock deadlocks against a pending
+	// SetPrivateKey writer; see lock-ordering.md).
 	device.staticIdentity.RLock()
-	defer device.staticIdentity.RUnlock()
+	publicKey := device.staticIdentity.publicKey
+	privateKey := device.staticIdentity.privateKey
+	device.staticIdentity.RUnlock()
 
-	mixHash(&hash, &InitialHash, device.staticIdentity.publicKey[:])
+	mixHash(&hash, &InitialHash, publicKey[:])
 	mixHash(&hash, &hash, msg.Ephemeral[:])
 	mixKey(&chainKey, &InitialChainKey, msg.Ephemeral[:])
 
 	// decrypt static key
 	var peerPK NoisePublicKey
 	var key [chacha20poly1305.KeySize]byte
-	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
+	ss, err := privateKey.sharedSecret(msg.Ephemeral)
 	if err != nil {
 		return nil
 	}
@@ -370,6 +376,11 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	mixHash(&hash, &hash, msg.Static[:])
 
 	// lookup peer
+
+	initEP, ok := endpoint.(conn.InitiationAwareEndpoint)
+	if ok {
+		initEP.InitiationMessagePublicKey(peerPK)
+	}
 
 	peer := device.LookupPeer(peerPK)
 	if peer == nil || !peer.isRunning.Load() {
@@ -509,7 +520,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	return &msg, nil
 }
 
-func (device *Device) ConsumeMessageResponse(msg *MessageResponse) (peer *Peer) {
+func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 	if msg.Type != MessageResponseType {
 		return nil
 	}
@@ -523,10 +534,17 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) (peer *Peer) 
 	}
 
 	var (
-		hash           [blake2s.Size]byte
-		chainKey       [blake2s.Size]byte
-		localEphemeral NoisePrivateKey
+		hash     [blake2s.Size]byte
+		chainKey [blake2s.Size]byte
 	)
+
+	// Snapshot the static private key before acquiring handshake.mutex so
+	// that handshake.mutex is never held while acquiring staticIdentity
+	// (which would invert the staticIdentity < handshake.mutex hierarchy;
+	// see lock-ordering.md).
+	device.staticIdentity.RLock()
+	privateKey := device.staticIdentity.privateKey
+	device.staticIdentity.RUnlock()
 
 	ok := func() bool {
 		// lock handshake state
@@ -537,11 +555,6 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) (peer *Peer) 
 		if handshake.state != handshakeInitiationCreated {
 			return false
 		}
-
-		// lock private key for reading
-
-		device.staticIdentity.RLock()
-		defer device.staticIdentity.RUnlock()
 
 		// finish 3-way DH
 
@@ -555,7 +568,7 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) (peer *Peer) 
 		mixKey(&chainKey, &chainKey, ss[:])
 		setZero(ss[:])
 
-		ss, err = device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
+		ss, err = privateKey.sharedSecret(msg.Ephemeral)
 		if err != nil {
 			return false
 		}
@@ -583,10 +596,6 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) (peer *Peer) 
 			return false
 		}
 		mixHash(&hash, &hash, msg.Empty[:])
-
-		// allow unlocking temporarily
-		copy(localEphemeral[:], handshake.localEphemeral[:])
-
 		return true
 	}()
 
@@ -597,22 +606,18 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) (peer *Peer) 
 	// update handshake state
 
 	handshake.mutex.Lock()
-	if handshake.state == handshakeInitiationCreated &&
-		handshake.localEphemeral.Equals(localEphemeral) {
-		handshake.hash = hash
-		handshake.chainKey = chainKey
-		handshake.remoteIndex = msg.Sender
-		handshake.state = handshakeResponseConsumed
-		peer = lookup.peer
-	}
+
+	handshake.hash = hash
+	handshake.chainKey = chainKey
+	handshake.remoteIndex = msg.Sender
+	handshake.state = handshakeResponseConsumed
 
 	handshake.mutex.Unlock()
 
 	setZero(hash[:])
 	setZero(chainKey[:])
-	setZero(localEphemeral[:])
 
-	return
+	return lookup.peer
 }
 
 /* Derives a new keypair from the current handshake state

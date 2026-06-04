@@ -608,10 +608,6 @@ func tcpGRO(bufs [][]byte, offset int, pktI int, table *tcpGROTable, isV6 bool) 
 			case coalesceItemInvalidCSum:
 				// delete the item with an invalid csum
 				table.deleteAt(item.key, i)
-				// The deleted item will not be re-visited in applyTCPCoalesceAccounting,
-				// so we must zero the virtioNetHdr. clear() is the equivalent of
-				// encoding a zero value virtioNetHdr.
-				clear(bufs[item.bufsIndex][offset-virtioNetHdrLen : offset])
 			case coalescePktInvalidCSum:
 				// no point in inserting an item that we can't coalesce
 				return groResultNoop
@@ -671,7 +667,11 @@ func applyTCPCoalesceAccounting(bufs [][]byte, offset int, table *tcpGROTable) e
 				psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_TCP, srcAddr, dstAddr, uint16(len(pkt)-int(item.iphLen)))
 				binary.BigEndian.PutUint16(pkt[hdr.csumStart+hdr.csumOffset:], checksum([]byte{}, psum))
 			} else {
-				clear(bufs[item.bufsIndex][offset-virtioNetHdrLen : offset])
+				hdr := virtioNetHdr{}
+				err := hdr.encode(bufs[item.bufsIndex][offset-virtioNetHdrLen:])
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -727,7 +727,11 @@ func applyUDPCoalesceAccounting(bufs [][]byte, offset int, table *udpGROTable) e
 				psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_UDP, srcAddr, dstAddr, uint16(len(pkt)-int(item.iphLen)))
 				binary.BigEndian.PutUint16(pkt[hdr.csumStart+hdr.csumOffset:], checksum([]byte{}, psum))
 			} else {
-				clear(bufs[item.bufsIndex][offset-virtioNetHdrLen : offset])
+				hdr := virtioNetHdr{}
+				err := hdr.encode(bufs[item.bufsIndex][offset-virtioNetHdrLen:])
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -744,7 +748,7 @@ const (
 	udp6GROCandidate
 )
 
-func packetIsGROCandidate(b []byte, canUDPGRO bool) groCandidateType {
+func packetIsGROCandidate(b []byte, gro groDisablementFlags) groCandidateType {
 	if len(b) < 28 {
 		return notGROCandidate
 	}
@@ -753,17 +757,17 @@ func packetIsGROCandidate(b []byte, canUDPGRO bool) groCandidateType {
 			// IPv4 packets w/IP options do not coalesce
 			return notGROCandidate
 		}
-		if b[9] == unix.IPPROTO_TCP && len(b) >= 40 {
+		if b[9] == unix.IPPROTO_TCP && len(b) >= 40 && gro.canTCPGRO() {
 			return tcp4GROCandidate
 		}
-		if b[9] == unix.IPPROTO_UDP && canUDPGRO {
+		if b[9] == unix.IPPROTO_UDP && gro.canUDPGRO() {
 			return udp4GROCandidate
 		}
 	} else if b[0]>>4 == 6 {
-		if b[6] == unix.IPPROTO_TCP && len(b) >= 60 {
+		if b[6] == unix.IPPROTO_TCP && len(b) >= 60 && gro.canTCPGRO() {
 			return tcp6GROCandidate
 		}
-		if b[6] == unix.IPPROTO_UDP && len(b) >= 48 && canUDPGRO {
+		if b[6] == unix.IPPROTO_UDP && len(b) >= 48 && gro.canUDPGRO() {
 			return udp6GROCandidate
 		}
 	}
@@ -856,15 +860,15 @@ func udpGRO(bufs [][]byte, offset int, pktI int, table *udpGROTable, isV6 bool) 
 // handleGRO evaluates bufs for GRO, and writes the indices of the resulting
 // packets into toWrite. toWrite, tcpTable, and udpTable should initially be
 // empty (but non-nil), and are passed in to save allocs as the caller may reset
-// and recycle them across vectors of packets. canUDPGRO indicates if UDP GRO is
-// supported.
-func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGROTable, canUDPGRO bool, toWrite *[]int) error {
+// and recycle them across vectors of packets. gro indicates if TCP and UDP GRO
+// are supported/enabled.
+func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGROTable, gro groDisablementFlags, toWrite *[]int) error {
 	for i := range bufs {
 		if offset < virtioNetHdrLen || offset > len(bufs[i])-1 {
 			return errors.New("invalid offset")
 		}
 		var result groResult
-		switch packetIsGROCandidate(bufs[i][offset:], canUDPGRO) {
+		switch packetIsGROCandidate(bufs[i][offset:], gro) {
 		case tcp4GROCandidate:
 			result = tcpGRO(bufs, offset, i, tcpTable, false)
 		case tcp6GROCandidate:
@@ -876,7 +880,11 @@ func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGR
 		}
 		switch result {
 		case groResultNoop:
-			clear(bufs[i][offset-virtioNetHdrLen : offset])
+			hdr := virtioNetHdr{}
+			err := hdr.encode(bufs[i][offset-virtioNetHdrLen:])
+			if err != nil {
+				return err
+			}
 			fallthrough
 		case groResultTableInsert:
 			*toWrite = append(*toWrite, i)

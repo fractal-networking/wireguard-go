@@ -38,7 +38,6 @@ type NativeTun struct {
 	statusListenersShutdown chan struct{}
 	batchSize               int
 	vnetHdr                 bool
-	udpGSO                  bool
 
 	closeOnce sync.Once
 
@@ -49,10 +48,34 @@ type NativeTun struct {
 	readOpMu sync.Mutex                    // readOpMu guards readBuff
 	readBuff [virtioNetHdrLen + 65535]byte // if vnetHdr every read() is prefixed by virtioNetHdr
 
-	writeOpMu   sync.Mutex // writeOpMu guards toWrite, tcpGROTable
+	writeOpMu   sync.Mutex // writeOpMu guards toWrite, tcpGROTable, udpGROTable, gro
 	toWrite     []int
 	tcpGROTable *tcpGROTable
 	udpGROTable *udpGROTable
+	gro         groDisablementFlags
+}
+
+type groDisablementFlags int
+
+const (
+	tcpGRODisabled groDisablementFlags = 1 << iota
+	udpGRODisabled
+)
+
+func (g *groDisablementFlags) disableTCPGRO() {
+	*g |= tcpGRODisabled
+}
+
+func (g *groDisablementFlags) canTCPGRO() bool {
+	return (*g)&tcpGRODisabled == 0
+}
+
+func (g *groDisablementFlags) disableUDPGRO() {
+	*g |= udpGRODisabled
+}
+
+func (g *groDisablementFlags) canUDPGRO() bool {
+	return (*g)&udpGRODisabled == 0
 }
 
 func (tun *NativeTun) File() *os.File {
@@ -345,7 +368,7 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	)
 	tun.toWrite = tun.toWrite[:0]
 	if tun.vnetHdr {
-		err := handleGRO(bufs, offset, tun.tcpGROTable, tun.udpGROTable, tun.udpGSO, &tun.toWrite)
+		err := handleGRO(bufs, offset, tun.tcpGROTable, tun.udpGROTable, tun.gro, &tun.toWrite)
 		if err != nil {
 			return 0, err
 		}
@@ -502,6 +525,20 @@ func (tun *NativeTun) BatchSize() int {
 	return tun.batchSize
 }
 
+// DisableUDPGRO disables UDP GRO if it is enabled.
+func (tun *NativeTun) DisableUDPGRO() {
+	tun.writeOpMu.Lock()
+	tun.gro.disableUDPGRO()
+	tun.writeOpMu.Unlock()
+}
+
+// DisableTCPGRO disables TCP GRO if it is enabled.
+func (tun *NativeTun) DisableTCPGRO() {
+	tun.writeOpMu.Lock()
+	tun.gro.disableTCPGRO()
+	tun.writeOpMu.Unlock()
+}
+
 const (
 	// TODO: support TSO with ECN bits
 	tunTCPOffloads = unix.TUN_F_CSUM | unix.TUN_F_TSO4 | unix.TUN_F_TSO6
@@ -514,9 +551,7 @@ func (tun *NativeTun) initFromFlags(name string) error {
 		return err
 	}
 	if e := sc.Control(func(fd uintptr) {
-		var (
-			ifr *unix.Ifreq
-		)
+		var ifr *unix.Ifreq
 		ifr, err = unix.NewIfreq(name)
 		if err != nil {
 			return
@@ -537,7 +572,9 @@ func (tun *NativeTun) initFromFlags(name string) error {
 			tun.batchSize = conn.IdealBatchSize
 			// tunUDPOffloads were added in Linux v6.2. We do not return an
 			// error if they are unsupported at runtime.
-			tun.udpGSO = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads|tunUDPOffloads) == nil
+			if unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads|tunUDPOffloads) != nil {
+				tun.gro.disableUDPGRO()
+			}
 		} else {
 			tun.batchSize = 1
 		}

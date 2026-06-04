@@ -51,3 +51,17 @@ type Device interface {
 	// lifetime of a Device.
 	BatchSize() int
 }
+
+// GRODevice is a Device extended with methods for disabling GRO. Certain OS
+// versions may have offload bugs. Where these bugs negatively impact throughput
+// or break connectivity entirely we can use these methods to disable the
+// related offload.
+type GRODevice interface {
+	Device
+
+	// DisableUDPGRO disables UDP GRO if it is enabled.
+	DisableUDPGRO()
+
+	// DisableTCPGRO disables TCP GRO if it is enabled.
+	DisableTCPGRO()
+}
