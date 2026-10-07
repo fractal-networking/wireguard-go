@@ -7,4 +7,8 @@
 
 package conn
 
-func NewDefaultBind() Bind { return NewStdNetBind() }
+import "github.com/sagernet/sing/common/control"
+
+func NewDefaultBind(externalControl control.Func) Bind {
+	return NewStdNetBind(externalControl)
+}

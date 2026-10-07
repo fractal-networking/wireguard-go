@@ -6,15 +6,20 @@
 package device
 
 import (
+	"context"
+	"errors"
+	"net/netip"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/ratelimiter"
-	"golang.zx2c4.com/wireguard/rwcancel"
-	"golang.zx2c4.com/wireguard/tun"
+	"github.com/fractal-networking/wireguard-go/conn"
+	"github.com/fractal-networking/wireguard-go/ratelimiter"
+	"github.com/fractal-networking/wireguard-go/rwcancel"
+	"github.com/fractal-networking/wireguard-go/tun"
+	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/pause"
 )
 
 type Device struct {
@@ -45,6 +50,7 @@ type Device struct {
 		port          uint16 // listening port
 		fwmark        uint32 // mark value (0 = disabled)
 		brokenRoaming bool
+		rebindPending atomic.Bool
 	}
 
 	staticIdentity struct {
@@ -56,7 +62,12 @@ type Device struct {
 	peers struct {
 		sync.RWMutex // protects keyMap
 		keyMap       map[NoisePublicKey]*Peer
+		lookupFunc   PeerLookupFunc // or nil if unused
 	}
+
+	peerStateFn        atomic.Pointer[PeerSessionStateFunc]     // observes peer session state changes, nil if unset
+	priorityMsgFn      atomic.Pointer[PeerPriorityMessageFunc]  // returns a priority message to be sent around session establishment, nil if unset
+	endpointResolverFn atomic.Pointer[PeerEndpointResolverFunc] // resolves candidate endpoints on handshake initiation, nil if unset
 
 	rate struct {
 		underLoadUntil atomic.Int64
@@ -68,11 +79,11 @@ type Device struct {
 	cookieChecker CookieChecker
 
 	pool struct {
-		inboundElementsContainer  *WaitPool
-		outboundElementsContainer *WaitPool
+		inboundElementsContainer  *sync.Pool
+		outboundElementsContainer *sync.Pool
 		messageBuffers            *WaitPool
-		inboundElements           *WaitPool
-		outboundElements          *WaitPool
+		inboundElements           *sync.Pool
+		outboundElements          *sync.Pool
 	}
 
 	queue struct {
@@ -86,9 +97,10 @@ type Device struct {
 		mtu    atomic.Int32
 	}
 
-	ipcMutex sync.RWMutex
-	closed   chan struct{}
-	log      *Logger
+	ipcMutex     sync.RWMutex
+	closed       chan struct{}
+	log          *Logger
+	pauseManager pause.Manager
 }
 
 // deviceState represents the state of a Device.
@@ -179,14 +191,22 @@ func (device *Device) upLocked() error {
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 
+	// Collect peers under RLock and then release before calling into them,
+	// because SendKeepalive can reach CreateMessageInitiation which acquires
+	// staticIdentity.RLock; holding peers.RLock across that path would
+	// invert the staticIdentity < peers hierarchy (see lock-ordering.md).
 	device.peers.RLock()
+	peers := make([]*Peer, 0, len(device.peers.keyMap))
 	for _, peer := range device.peers.keyMap {
+		peers = append(peers, peer)
+	}
+	device.peers.RUnlock()
+	for _, peer := range peers {
 		peer.Start()
 		if peer.persistentKeepaliveInterval.Load() > 0 {
 			peer.SendKeepalive()
 		}
 	}
-	device.peers.RUnlock()
 	return nil
 }
 
@@ -281,8 +301,9 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	return nil
 }
 
-func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
+func NewDevice(ctx context.Context, tunDevice tun.Device, bind conn.Bind, logger *Logger, workers int) *Device {
 	device := new(Device)
+	device.pauseManager = service.FromContext[pause.Manager](ctx)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
 	device.log = logger
@@ -308,10 +329,12 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 
 	// start workers
 
-	cpus := runtime.NumCPU()
+	if workers == 0 {
+		workers = runtime.NumCPU()
+	}
 	device.state.stopping.Wait()
-	device.queue.encryption.wg.Add(cpus) // One for each RoutineHandshake
-	for i := 0; i < cpus; i++ {
+	device.queue.encryption.wg.Add(workers) // One for each RoutineHandshake
+	for i := 0; i < workers; i++ {
 		go device.RoutineEncryption(i + 1)
 		go device.RoutineDecryption(i + 1)
 		go device.RoutineHandshake(i + 1)
@@ -338,12 +361,70 @@ func (device *Device) BatchSize() int {
 	return size
 }
 
+// AllowedIPs returns the device's allowed IPs routing table.
+func (device *Device) AllowedIPs() *AllowedIPs {
+	return &device.allowedips
+}
+
+// LookupPeer looks up a peer by its public key.
+//
+// If the peer does not exist and a [PeerLookupFunc] is set (via
+// [Device.SetPeerLookupFunc]), then that function is used to create the peer
+// before returning it. Peers created via this mechanism exist only until their
+// state machine reaches idle, and then the peers are removed.
+//
+// If the peer does not exist and no [PeerLookupFunc] is set, nil is returned.
+//
+// Use [Device.LookupActivePeer] to only return already-existing peers, without
+// using a [PeerLookupFunc].
 func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 	device.peers.RLock()
-	defer device.peers.RUnlock()
+	p, ok := device.peers.keyMap[pk]
+	lookupFunc := device.peers.lookupFunc
+	device.peers.RUnlock()
+	if ok || lookupFunc == nil {
+		return p
+	}
 
-	return device.peers.keyMap[pk]
+	conf, ok := lookupFunc(pk)
+	if !ok || conf == nil {
+		return nil
+	}
+
+	p, err := device.NewPeer(pk)
+	if err != nil {
+		if errors.Is(err, errAddExistingPeer) {
+			device.peers.RLock()
+			defer device.peers.RUnlock()
+			return device.peers.keyMap[pk]
+		}
+		device.log.Errorf("Failed to create peer: %v", err)
+		return nil
+	}
+	p.SetAllowedIPs(conf.AllowedIPs)
+	p.deleteOnIdle = true
+	if conf.Endpoint != nil {
+		p.SetEndpointFromPacket(conf.Endpoint)
+	}
+	p.Start()
+	return p
 }
+
+// LookupActivePeer looks up a peer by its public key.
+//
+// Unlike [Device.LookupPeer], this function does not use a [PeerLookupFunc] to
+// create the peer if it does not already exist.
+//
+// If the peer does not exist or was created lazily via [PeerLookupFunc]
+// and has subsequently idled away, it returns (nil, false).
+func (device *Device) LookupActivePeer(pk NoisePublicKey) (_ *Peer, ok bool) {
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+	p, ok := device.peers.keyMap[pk]
+	return p, ok
+}
+
+var errAddExistingPeer = errors.New("adding existing peer")
 
 func (device *Device) RemovePeer(key NoisePublicKey) {
 	device.peers.Lock()
@@ -365,6 +446,180 @@ func (device *Device) RemoveAllPeers() {
 	}
 
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
+}
+
+// RemoveMatchingPeers removes all peers for which shouldRemove returns true.
+//
+// It returns the number of peers removed.
+func (device *Device) RemoveMatchingPeers(shouldRemove func(NoisePublicKey) bool) (numRemoved int) {
+	device.peers.Lock()
+	defer device.peers.Unlock()
+
+	for key, peer := range device.peers.keyMap {
+		if shouldRemove(key) {
+			removePeerLocked(device, peer, key)
+			numRemoved++
+		}
+	}
+	return numRemoved
+}
+
+// NewPeerConfig are the configuration parameters for a new peer created via a
+// [PeerLookupFunc] func.
+type NewPeerConfig struct {
+	// AllowedIPs is the initial set of allowed IPs for the new peer.
+	AllowedIPs []netip.Prefix
+
+	// Endpoint, if non-nil, sets the initial endpoint for newly
+	// created peers.
+	Endpoint conn.Endpoint
+}
+
+// PeerLookupFunc is the type of function used to look up peers by public key
+// when receiving packets for unknown peers.
+//
+// If it returns nil, the peer is not known.
+//
+// Otherwise, returning non-nil signals that wireguard-go should create the peer
+// with the provided allowed IPs.
+//
+// See [Device.SetPeerLookupFunc] and [Device.LookupPeer].
+type PeerLookupFunc func(NoisePublicKey) (_ *NewPeerConfig, ok bool)
+
+// PeerByIPPacketFunc is the type of function used to look up a peer to send to
+// for a given src/dst IP pair. The ipPkt parameter is the raw IP packet being
+// routed; callers needing transport-layer ports or other header fields may parse
+// them from ipPkt, but must handle IP fragmentation (ports may be absent on
+// non-first fragments) and protocols that do not use ports (e.g. ICMP).
+//
+// Except for experimental use cases, dst is the only address
+// that should be relied upon when looking up a peer.
+//
+// If it returns ok=false, the peer is not known.
+//
+// See [Device.SetPeerByIPPacketFunc] and [Device.SetPeerLookupFunc].
+type PeerByIPPacketFunc func(src, dst netip.Addr, ipPkt []byte) (_ NoisePublicKey, ok bool)
+
+// PeerSessionState is the current WireGuard session state for a peer.
+type PeerSessionState uint8
+
+const (
+	// PeerSessionNone means there is no handshake in progress and no session key
+	// material retained for this peer.
+	PeerSessionNone PeerSessionState = iota
+
+	// PeerSessionHandshake means a handshake is in progress for this peer, but
+	// there is not currently a usable WireGuard session.
+	PeerSessionHandshake
+
+	// PeerSessionEstablished means the peer has a completed WireGuard session
+	// with usable session key material.
+	PeerSessionEstablished
+
+	// PeerSessionExpired means the peer's session key material is no longer
+	// considered usable, but final key cleanup or lazy peer removal may not have
+	// happened yet.
+	PeerSessionExpired
+)
+
+// PeerSessionStateFunc is called when a peer's WireGuard session state changes.
+//
+// Calls are serialized per peer and delivered in that peer's transition order. The
+// callback must be cheap and must not call back into Device.
+type PeerSessionStateFunc func(peer NoisePublicKey, state PeerSessionState)
+
+// SetPeerLookupFunc sets the function used to look up peers by public key
+// when receiving packets for unknown peers.
+func (device *Device) SetPeerLookupFunc(f PeerLookupFunc) {
+	device.peers.Lock()
+	defer device.peers.Unlock()
+	device.peers.lookupFunc = f
+}
+
+// SetPeerByIPPacketFunc sets the function used to look up peers by IP address
+// when sending packets to unknown peers.
+func (device *Device) SetPeerByIPPacketFunc(f PeerByIPPacketFunc) {
+	device.allowedips.mu.Lock()
+	defer device.allowedips.mu.Unlock()
+	device.allowedips.peerByIPPacketFunc = f
+	device.allowedips.device = device
+}
+
+// SetSessionStateFunc sets the function used to observe peer WireGuard session
+// state changes.
+//
+// It does not replay current state. Callers that need a complete view should set
+// it before peers are started or lazily created, and maintain any snapshots,
+// sequence numbers, and pubsub state outside wireguard-go.
+//
+// The callback must be concurrent-safe and must not call back into Device.
+func (device *Device) SetSessionStateFunc(f PeerSessionStateFunc) {
+	if f == nil {
+		device.peerStateFn.Store(nil)
+		return
+	}
+	device.peerStateFn.Store(&f)
+}
+
+// MaxPriorityMessageContentSize is the maximum size of a message returned by a
+// [PeerPriorityMessageFunc]. It's a power of 2 that leaves significant space
+// when accounting for all WireGuard overhead and encapsulating network protocol
+// headers. Future adjustments to this value should consider all these overheads
+// and any [conn.Bind] implementation limitations.
+const MaxPriorityMessageContentSize = 512
+
+// PeerPriorityMessageFunc is called when a peer's WireGuard session keypair is
+// established (or re-keyed) for forward data transmission.
+//
+// The returned message is transmitted to the peer in priority fashion. Priority
+// means it cannot be evicted from the staged packet queue by non-priority
+// (read from [tun.Device]) packets. It avoids the staged queue altogether.
+//
+// The callback must be cheap and must not call back into [Device]. A zero length
+// message or a message whose length exceeds [MaxPriorityMessageContentSize] will
+// be silently dropped. Message should start with an IPv4 or IPv6 header as it
+// is subject to allowed IPs lookup on the receiver, same as any other transport
+// message.
+type PeerPriorityMessageFunc func(peer NoisePublicKey) (msg []byte)
+
+// SetPriorityMessageOnEstablishmentFunc sets a function to be used for sending
+// a priority message around session establishment. See [PeerPriorityMessageFunc]
+// docs for more details. A nil value clears any previously set value.
+func (device *Device) SetPriorityMessageOnEstablishmentFunc(f PeerPriorityMessageFunc) {
+	if f == nil {
+		device.priorityMsgFn.Store(nil)
+		return
+	}
+	device.priorityMsgFn.Store(&f)
+}
+
+// PeerEndpointResolverFunc is called on every handshake initiation to obtain the
+// candidate endpoints for a peer. The initiation is sent to the peer's current
+// endpoint and every candidate; the source of the first valid reply becomes the
+// current endpoint via roaming. When it fails, the candidates from its last
+// successful invocation for that peer are reused.
+//
+// It is called from the goroutine initiating the handshake, which blocks until
+// it returns, including when the initiation originates from within [Device.IpcSet].
+//
+// The callback must be concurrent-safe and must not call back into [Device].
+type PeerEndpointResolverFunc func(peer NoisePublicKey) ([]conn.Endpoint, error)
+
+// SetEndpointResolverFunc sets the function used to resolve peer endpoints. See
+// [PeerEndpointResolverFunc] docs for more details. A nil value clears any
+// previously set value.
+//
+// Because it is keyed by public key rather than held per peer, it can be set
+// before the peers exist. Setting it before the [Device.IpcSet] that creates
+// them is the only way a peer configured without an endpoint can resolve one in
+// time for the handshake initiation that same IpcSet triggers, for a peer with
+// persistent keepalives on an up device.
+func (device *Device) SetEndpointResolverFunc(f PeerEndpointResolverFunc) {
+	if f == nil {
+		device.endpointResolverFn.Store(nil)
+		return
+	}
+	device.endpointResolverFn.Store(&f)
 }
 
 func (device *Device) Close() {
@@ -408,16 +663,25 @@ func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
 		return
 	}
 
+	// Collect the set of peers to keepalive under peers.RLock, then release
+	// before invoking SendKeepalive. SendKeepalive can reach
+	// CreateMessageInitiation which acquires staticIdentity.RLock; holding
+	// peers.RLock across that path would invert the
+	// staticIdentity < peers hierarchy (see lock-ordering.md).
+	var peers []*Peer
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
 		peer.keypairs.RLock()
 		sendKeepalive := peer.keypairs.current != nil && !peer.keypairs.current.created.Add(RejectAfterTime).Before(time.Now())
 		peer.keypairs.RUnlock()
 		if sendKeepalive {
-			peer.SendKeepalive()
+			peers = append(peers, peer)
 		}
 	}
 	device.peers.RUnlock()
+	for _, peer := range peers {
+		peer.SendKeepalive()
+	}
 }
 
 // closeBindLocked closes the device's net.bind.
@@ -466,6 +730,22 @@ func (device *Device) BindSetMark(mark uint32) error {
 	device.peers.RUnlock()
 
 	return nil
+}
+
+// scheduleBindUpdate reopens the bind from a new goroutine: the send and
+// receive paths that report conn.ErrRebindRequired run under the net read
+// lock or are waited for by closeBindLocked.
+func (device *Device) scheduleBindUpdate() {
+	if !device.net.rebindPending.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer device.net.rebindPending.Store(false)
+		err := device.BindUpdate()
+		if err != nil {
+			device.log.Errorf("Failed to reopen bind: %v", err)
+		}
+	}()
 }
 
 func (device *Device) BindUpdate() error {

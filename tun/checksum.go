@@ -92,6 +92,11 @@ func checksum(b []byte, initial uint64) uint16 {
 	return uint16(ac)
 }
 
+// Checksum computes an IP checksum starting with the provided initial value.
+func Checksum(data []byte, initial uint16) uint16 {
+	return checksum(data, uint64(initial))
+}
+
 func pseudoHeaderChecksumNoFold(protocol uint8, srcAddr, dstAddr []byte, totalLen uint16) uint64 {
 	sum := checksumNoFold(srcAddr, 0)
 	sum = checksumNoFold(dstAddr, sum)
@@ -99,4 +104,10 @@ func pseudoHeaderChecksumNoFold(protocol uint8, srcAddr, dstAddr []byte, totalLe
 	tmp := make([]byte, 2)
 	binary.BigEndian.PutUint16(tmp, totalLen)
 	return checksumNoFold(tmp, sum)
+}
+
+// PseudoHeaderChecksum computes an IP pseudo-header checksum. srcAddr and
+// dstAddr must be 4 or 16 bytes in length.
+func PseudoHeaderChecksum(protocol uint8, srcAddr, dstAddr []byte, totalLen uint16) uint16 {
+	return checksum([]byte{}, pseudoHeaderChecksumNoFold(protocol, srcAddr, dstAddr, totalLen))
 }
